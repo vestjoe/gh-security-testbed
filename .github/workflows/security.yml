@@ -188,20 +188,28 @@ jobs:
           mkdir -p sarif
 
           # Diff-aware on PRs so the gate only sees what the PR introduced;
-          # full history everywhere else.
-          log_opts=()
+          # the full history of *this ref* everywhere else.
+          #
+          # The second case has to be explicit. `gitleaks git` with no
+          # --log-opts scans every ref in the repository, and checkout with
+          # fetch-depth 0 fetches all of them -- so a push to the default branch
+          # reports secrets that live only on unrelated branches, attributed to
+          # the default branch. `--full-history HEAD` restricts the walk to
+          # commits reachable from the checked-out ref, which still catches a
+          # secret that was committed to this branch and later removed.
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            log_opts+=("--log-opts=${BASE_SHA}..${HEAD_SHA}")
+            log_opts="--log-opts=${BASE_SHA}..${HEAD_SHA}"
             echo "Scanning PR commit range ${BASE_SHA}..${HEAD_SHA}"
           else
-            echo "Scanning full history"
+            log_opts="--log-opts=--full-history HEAD"
+            echo "Scanning the full history reachable from HEAD"
           fi
 
           # --exit-code 0: findings must not fail this job; the gate decides.
           # --redact: keeps matched secret values out of logs and out of the
           # SARIF, which is uploaded to code scanning on public repos.
           docker run --rm -v "$PWD:/repo" -w /repo "$IMAGE" git /repo \
-            "${log_opts[@]}" \
+            "$log_opts" \
             --exit-code 0 \
             --redact \
             --no-banner \
