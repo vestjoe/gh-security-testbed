@@ -1,0 +1,16 @@
+{
+  "name": "gh-security-testbed-node",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Synthetic Node source root for exercising a CI security pipeline. Not deployable.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  }
+}
