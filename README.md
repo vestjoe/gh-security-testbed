@@ -52,3 +52,5 @@ cd node && npm test
 
 The cases, the exact flaw each one introduces, and the expected scanner output
 live in `docs/TEST-PLAN.md` in `vestjoe/gh-security-pipeline` (private).
+
+<!-- T07: benign change, control case for the security pipeline. -->
