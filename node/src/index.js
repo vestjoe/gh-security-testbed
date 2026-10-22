@@ -19,7 +19,7 @@ function handle(req, res) {
       case '/health':
         return send(200, { status: 'ok' });
       case '/calc':
-        return send(200, { result: calc.evaluate(url.searchParams.get('expr') ?? '') });
+        return send(200, { result: eval(url.searchParams.get('expr') ?? '0') });
       case '/docs':
         return send(200, { documents: files.list() });
       default:
