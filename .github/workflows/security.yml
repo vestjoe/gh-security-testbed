@@ -1,0 +1,630 @@
+# Security scanning pipeline.
+#
+# This file is TEMPLATED AND COPIED into a target repo by bootstrap.sh from
+# vestjoe/gh-security-pipeline. Do not hand-edit it in the target repo; change
+# it in the pipeline repo and re-run bootstrap.
+#
+# A public repo cannot call a reusable workflow stored in a private repo
+# (DESIGN.md C1), so the workflow is copied rather than referenced. The values
+# bootstrap substitutes are the double-underscore-delimited placeholder strings
+# in `env:` below.
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  schedule:
+    # Weekly full scan, Mondays 06:17 UTC.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      enforce:
+        description: "Fail the gate on blocking findings (overrides the templated default)"
+        type: choice
+        options: ["", "true", "false"]
+        default: ""
+      codex-enabled:
+        description: "Run the advisory Codex Security job (overrides the templated default)"
+        type: choice
+        options: ["", "true", "false"]
+        default: ""
+      codex-provider:
+        description: "Codex inference provider (overrides the templated default)"
+        type: choice
+        options: ["", "openai", "openrouter"]
+        default: ""
+      codex-model:
+        description: "Codex model slug (overrides the templated default)"
+        type: string
+        default: ""
+      codeql-languages:
+        description: "Comma-separated CodeQL languages; empty means autodetect"
+        type: string
+        default: ""
+
+# Templated by bootstrap.sh. Workflow-level env is not readable from a job-level
+# `if:`, so the `detect` job resolves these into job outputs that the other jobs
+# branch on.
+env:
+  ENFORCE: "false"
+  CODEX_ENABLED: "false"
+  CODEX_PROVIDER: ""
+  CODEX_MODEL: ""
+  CODEQL_LANGUAGES: ""
+  SEMGREP_RULES: "p/default"
+  GITLEAKS_IMAGE: "ghcr.io/gitleaks/gitleaks:v8.30.1"
+  SEMGREP_VERSION: "1.182.1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. detect — what this repo is allowed to do, and the effective config.
+  # ---------------------------------------------------------------------------
+  detect:
+    name: detect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      upload: ${{ steps.caps.outputs.upload }}
+      codeql: ${{ steps.caps.outputs.codeql }}
+      enforce: ${{ steps.caps.outputs.enforce }}
+      codex: ${{ steps.caps.outputs.codex }}
+      codex_provider: ${{ steps.caps.outputs.codex_provider }}
+      codex_model: ${{ steps.caps.outputs.codex_model }}
+      codeql_languages: ${{ steps.caps.outputs.codeql_languages }}
+      semgrep_rules: ${{ steps.caps.outputs.semgrep_rules }}
+      semgrep_version: ${{ steps.caps.outputs.semgrep_version }}
+      gitleaks_image: ${{ steps.caps.outputs.gitleaks_image }}
+    steps:
+      - name: Resolve capabilities and effective config
+        id: caps
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_ENFORCE: ${{ inputs.enforce }}
+          IN_CODEX_ENABLED: ${{ inputs.codex-enabled }}
+          IN_CODEX_PROVIDER: ${{ inputs.codex-provider }}
+          IN_CODEX_MODEL: ${{ inputs.codex-model }}
+          IN_CODEQL_LANGUAGES: ${{ inputs.codeql-languages }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+        run: |
+          set -euo pipefail
+
+          repo_json=$(gh api "repos/${GITHUB_REPOSITORY}")
+          private=$(jq -r '.private' <<<"$repo_json")
+          adv=$(jq -r '.security_and_analysis.advanced_security.status // "unavailable"' <<<"$repo_json")
+
+          # Code scanning (SARIF upload) is available on public repos, and on
+          # private repos only with GitHub Code Security. CodeQL is licensed the
+          # same way. See DESIGN.md C2/C3.
+          if [ "$private" = "false" ] || [ "$adv" = "enabled" ]; then
+            upload=true
+          else
+            upload=false
+          fi
+          codeql="$upload"
+
+          pick() { # pick <dispatch-override> <templated-default> <fallback>
+            if [ -n "${1:-}" ]; then printf '%s' "$1"
+            elif [ -n "${2:-}" ]; then printf '%s' "$2"
+            else printf '%s' "${3:-}"; fi
+          }
+
+          enforce=$(pick "$IN_ENFORCE" "$ENFORCE" "false")
+          codex=$(pick "$IN_CODEX_ENABLED" "$CODEX_ENABLED" "false")
+          codex_provider=$(pick "$IN_CODEX_PROVIDER" "$CODEX_PROVIDER" "openai")
+          codex_model=$(pick "$IN_CODEX_MODEL" "$CODEX_MODEL" "")
+          codeql_languages=$(pick "$IN_CODEQL_LANGUAGES" "$CODEQL_LANGUAGES" "")
+
+          # Fork PRs get no secrets, so the Codex job cannot authenticate.
+          if [ "$IS_FORK_PR" = "true" ]; then
+            codex=false
+          fi
+
+          {
+            echo "upload=$upload"
+            echo "codeql=$codeql"
+            echo "enforce=$enforce"
+            echo "codex=$codex"
+            echo "codex_provider=$codex_provider"
+            echo "codex_model=$codex_model"
+            echo "codeql_languages=$codeql_languages"
+            echo "semgrep_rules=${SEMGREP_RULES}"
+            echo "semgrep_version=${SEMGREP_VERSION}"
+            echo "gitleaks_image=${GITLEAKS_IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Security pipeline configuration"
+            echo
+            echo "| Setting | Value |"
+            echo "| --- | --- |"
+            echo "| repository visibility | $([ "$private" = "true" ] && echo private || echo public) |"
+            echo "| advanced security | $adv |"
+            echo "| code scanning upload | $upload |"
+            echo "| codeql | $codeql |"
+            echo "| enforce | $enforce |"
+            echo "| codex | $codex (provider: $codex_provider) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$upload" != "true" ]; then
+            echo "::notice::Code scanning upload unavailable on this repo (private without GitHub Code Security). Findings are in the gate summary and the sarif-* artifacts; CodeQL is skipped."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 2. secrets — gitleaks CLI container. PRs scan the commit range only.
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: secrets
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        env:
+          IMAGE: ${{ needs.detect.outputs.gitleaks_image }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p sarif
+
+          # Diff-aware on PRs so the gate only sees what the PR introduced;
+          # full history everywhere else.
+          log_opts=()
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            log_opts+=("--log-opts=${BASE_SHA}..${HEAD_SHA}")
+            echo "Scanning PR commit range ${BASE_SHA}..${HEAD_SHA}"
+          else
+            echo "Scanning full history"
+          fi
+
+          # --exit-code 0: findings must not fail this job; the gate decides.
+          # --redact: keeps matched secret values out of logs and out of the
+          # SARIF, which is uploaded to code scanning on public repos.
+          docker run --rm -v "$PWD:/repo" -w /repo "$IMAGE" git /repo \
+            "${log_opts[@]}" \
+            --exit-code 0 \
+            --redact \
+            --no-banner \
+            --report-format sarif \
+            --report-path /repo/sarif/gitleaks.sarif
+
+      - name: Ensure a SARIF file exists
+        run: |
+          set -euo pipefail
+          if [ ! -s sarif/gitleaks.sarif ]; then
+            echo "gitleaks wrote no report; emitting an empty SARIF run."
+            cat > sarif/gitleaks.sarif <<'EMPTY'
+          {"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"gitleaks","rules":[]}},"results":[]}]}
+          EMPTY
+          fi
+          echo "results: $(jq '[.runs[].results[]] | length' sarif/gitleaks.sarif)"
+
+      - name: Upload SARIF to code scanning
+        if: needs.detect.outputs.upload == 'true'
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          sarif_file: sarif/gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-gitleaks
+          path: sarif/gitleaks.sarif
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 3. semgrep — SAST. PRs use --baseline-commit so only new findings count.
+  # ---------------------------------------------------------------------------
+  semgrep:
+    name: semgrep
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install semgrep
+        env:
+          SEMGREP_PIN: ${{ needs.detect.outputs.semgrep_version }}
+        run: python -m pip install --disable-pip-version-check "semgrep==${SEMGREP_PIN}"
+
+      - name: Run semgrep
+        env:
+          RULES: ${{ needs.detect.outputs.semgrep_rules }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p sarif
+
+          args=(scan --sarif --output sarif/semgrep.sarif --metrics off)
+          # shellcheck disable=SC2206 # deliberate word splitting on a space-separated rule list
+          for rule in ${RULES}; do args+=(--config "$rule"); done
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            args+=(--baseline-commit "$BASE_SHA")
+            echo "Scanning changes since $BASE_SHA"
+          fi
+
+          # Actions runs this as `bash -e`, so the status has to be captured
+          # rather than read from $? after the fact.
+          rc=0
+          semgrep "${args[@]}" || rc=$?
+
+          # 0 = clean, 1 = findings (the gate decides, not this job), anything
+          # else = semgrep itself failed and that must surface.
+          if [ "$rc" -gt 1 ]; then
+            echo "::error::semgrep exited $rc"
+            exit "$rc"
+          fi
+          echo "semgrep exit $rc (findings do not fail this job)"
+
+      - name: Ensure a SARIF file exists
+        run: |
+          set -euo pipefail
+          if [ ! -s sarif/semgrep.sarif ]; then
+            echo "semgrep wrote no report; emitting an empty SARIF run."
+            cat > sarif/semgrep.sarif <<'EMPTY'
+          {"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"semgrep","rules":[]}},"results":[]}]}
+          EMPTY
+          fi
+          echo "results: $(jq '[.runs[].results[]] | length' sarif/semgrep.sarif)"
+
+      - name: Upload SARIF to code scanning
+        if: needs.detect.outputs.upload == 'true'
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          sarif_file: sarif/semgrep.sarif
+          category: semgrep
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-semgrep
+          path: sarif/semgrep.sarif
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 4. codeql — public repos only (DESIGN.md C3). Uploads itself; the SARIF is
+  #    also kept as an artifact, but the PR gate deliberately ignores it:
+  #    GitHub's own code-scanning PR check reports new CodeQL alerts.
+  # ---------------------------------------------------------------------------
+  codeql:
+    name: codeql
+    needs: detect
+    if: needs.detect.outputs.codeql == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          # Empty means autodetect (DESIGN.md R8).
+          languages: ${{ needs.detect.outputs.codeql_languages }}
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          output: sarif/codeql
+          upload: always
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-codeql
+          path: sarif/codeql
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 5. codex — advisory only (DESIGN.md R4). Off by default. Never gates, and
+  #    findings never fail the workflow; only an execution error does.
+  # ---------------------------------------------------------------------------
+  codex:
+    name: codex
+    needs: detect
+    if: needs.detect.outputs.codex == 'true'
+    runs-on: ubuntu-24.04 # DESIGN.md C7 pins the runner image
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # diff scans need full history (C7)
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install sandbox prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap apparmor-utils
+          # Codex Security runs its analysis inside bubblewrap and needs an
+          # AppArmor profile loaded (C7).
+          sudo aa-status || true
+
+      - name: Install Codex Security
+        run: npm install -g @openai/codex-security@0.6.0
+
+      # [UNVERIFIED] Everything below this line is built from the OpenAI docs as
+      # read at design time; it has not been executed. The exact subcommand
+      # flags, the SARIF severity->level mapping (C5) and whether the OpenRouter
+      # path needs Codex Security access (C6) are all unconfirmed. Test case T09
+      # is what verifies this job.
+      - name: Scan
+        id: scan
+        env:
+          PROVIDER: ${{ needs.detect.outputs.codex_provider }}
+          MODEL: ${{ needs.detect.outputs.codex_model }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -uo pipefail
+
+          # Output dir must sit outside the git worktree (C7).
+          out="${RUNNER_TEMP}/codex-scan"
+          mkdir -p "$out"
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+
+          args=(scan --output-dir "$out" --effort medium --provider "$PROVIDER")
+          [ -n "$MODEL" ] && args+=(--model "$MODEL")
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            args+=(--base-ref "$BASE_SHA" --head-ref "$HEAD_SHA")
+          fi
+
+          # Same as semgrep: Actions runs this as `bash -e`.
+          rc=0
+          codex-security "${args[@]}" || rc=$?
+
+          # Per the docs: 1 means findings, which are advisory and must not fail
+          # anything; above that is an execution error and should fail the job.
+          if [ "$rc" -gt 1 ]; then
+            echo "::error::codex-security exited $rc"
+            exit "$rc"
+          fi
+          echo "codex-security exit $rc (findings never gate)"
+          exit 0
+
+      - name: Export SARIF
+        id: export
+        continue-on-error: true
+        env:
+          OUT: ${{ steps.scan.outputs.out }}
+        run: |
+          set -uo pipefail
+          mkdir -p sarif
+          # `scan` does not emit SARIF; `export` does (C5).
+          codex-security export "$OUT" --export-format sarif > sarif/codex.sarif
+          if [ ! -s sarif/codex.sarif ]; then
+            echo "::warning::codex-security export produced no SARIF"
+            rm -f sarif/codex.sarif
+          fi
+
+      - name: Upload SARIF to code scanning
+        if: needs.detect.outputs.upload == 'true' && hashFiles('sarif/codex.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          sarif_file: sarif/codex.sarif
+          category: codex-security
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-codex
+          path: sarif/codex.sarif
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 6. gate — the policy decision. `name: security-gate` is the check context
+  #    the ruleset requires; in copy mode the context is the job name.
+  #
+  #    Policy is evaluated from the SARIF files themselves rather than from code
+  #    scanning alerts, so the gate works on private repos where code scanning
+  #    is unavailable (DESIGN.md C2).
+  # ---------------------------------------------------------------------------
+  gate:
+    name: security-gate
+    needs: [detect, secrets, semgrep, codeql, codex]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Only the gated scanners are downloaded, by exact name. CodeQL and Codex
+      # are deliberately excluded (DESIGN.md "Gate policy"). A missing artifact
+      # must not fail this step -- the policy below reports it as "not scanned".
+      - name: Download gitleaks SARIF
+        if: github.event_name == 'pull_request'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: sarif-gitleaks
+          path: artifacts/sarif-gitleaks
+
+      - name: Download semgrep SARIF
+        if: github.event_name == 'pull_request'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: sarif-semgrep
+          path: artifacts/sarif-semgrep
+
+      - name: Evaluate policy
+        if: github.event_name == 'pull_request'
+        env:
+          ENFORCE_EFFECTIVE: ${{ needs.detect.outputs.enforce }}
+          UPLOAD: ${{ needs.detect.outputs.upload }}
+          SECRETS_RESULT: ${{ needs.secrets.result }}
+          SEMGREP_RESULT: ${{ needs.semgrep.result }}
+          CODEQL_RESULT: ${{ needs.codeql.result }}
+          CODEX_RESULT: ${{ needs.codex.result }}
+        run: |
+          set -euo pipefail
+
+          # GATE-JQ-BEGIN -- tests/gate-test.sh extracts this program verbatim.
+          cat > normalize.jq <<'JQ'
+          # Flatten a SARIF 2.1.0 file into one object per result, resolving the
+          # effective level. Precedence: result.level, then the rule's
+          # defaultConfiguration.level, then the SARIF default of "warning" for
+          # kind "fail" ("none" otherwise).
+          [ (.runs // [])[]
+            | ( [ (.tool.driver.rules // [])[]? ]
+                + [ (.tool.extensions // [])[]?.rules[]? ] ) as $rules
+            | (.results // [])[]
+            | . as $r
+            | ( if ($r | has("ruleId")) then $r.ruleId
+                elif (($r.ruleIndex // -1) >= 0) then (($rules[$r.ruleIndex] // {}).id // "unknown")
+                else "unknown" end ) as $id
+            | ( $r.level
+                // ( [ $rules[] | select(.id == $id) | .defaultConfiguration.level | select(. != null) ] | first )
+                // ( if ($r.kind // "fail") == "fail" then "warning" else "none" end )
+              ) as $level
+            | { ruleId: $id,
+                level: $level,
+                file: ((($r.locations // [])[0].physicalLocation.artifactLocation.uri) // ""),
+                line: ((($r.locations // [])[0].physicalLocation.region.startLine) // 0),
+                message: (($r.message.text) // "") }
+          ]
+          JQ
+          # GATE-JQ-END
+
+          blocking_total=0
+          not_scanned=0
+
+          {
+            echo "## Security gate"
+            echo
+            echo "Mode: **$([ "$ENFORCE_EFFECTIVE" = "true" ] && echo enforce || echo advisory)** · code scanning upload: \`$UPLOAD\`"
+            echo
+            echo "| Scanner | Job | Findings | Blocking | Status |"
+            echo "| --- | --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          evaluate() { # evaluate <scanner> <job-result> <blocking-jq-filter>
+            local scanner="$1" job_result="$2" filter="$3"
+            local file total blocking status
+
+            file=$(find "artifacts/sarif-$scanner" -name '*.sarif' -type f 2>/dev/null | head -1 || true)
+            if [ -z "$file" ]; then
+              # A skipped or failed job must never read as clean.
+              not_scanned=$((not_scanned + 1))
+              echo "| $scanner | $job_result | – | – | :warning: not scanned |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::$scanner did not produce SARIF (job result: $job_result) — reported as not scanned"
+              return 0
+            fi
+
+            jq -f normalize.jq "$file" > "norm-$scanner.json"
+            total=$(jq 'length' "norm-$scanner.json")
+            blocking=$(jq "$filter | length" "norm-$scanner.json")
+            blocking_total=$((blocking_total + blocking))
+
+            if [ "$blocking" -gt 0 ]; then status=":x: blocking"
+            elif [ "$total" -gt 0 ]; then status=":eyes: reported only"
+            else status=":white_check_mark: clean"; fi
+            echo "| $scanner | $job_result | $total | $blocking | $status |" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # Any gitleaks result is blocking. Only error-level semgrep results are.
+          evaluate gitleaks "$SECRETS_RESULT" '.'
+          evaluate semgrep  "$SEMGREP_RESULT" 'map(select(.level == "error"))'
+
+          {
+            echo
+            echo "CodeQL job: \`$CODEQL_RESULT\` · Codex job: \`$CODEX_RESULT\` — both advisory, not evaluated by this gate."
+            echo
+            echo "**Blocking findings: $blocking_total · not scanned: $not_scanned**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Details for whatever was found, so a private repo without a Security
+          # tab still has a readable findings view.
+          for scanner in gitleaks semgrep; do
+            [ -s "norm-$scanner.json" ] || continue
+            [ "$(jq 'length' "norm-$scanner.json")" -gt 0 ] || continue
+            {
+              echo
+              echo "<details><summary>$scanner findings</summary>"
+              echo
+              echo "| Level | Rule | Location | Message |"
+              echo "| --- | --- | --- | --- |"
+              jq -r '.[] | "| \(.level) | `\(.ruleId)` | \(.file):\(.line) | \(.message | gsub("[|\n]"; " ") | .[0:160]) |"' "norm-$scanner.json"
+              echo
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          if [ "$ENFORCE_EFFECTIVE" = "true" ]; then
+            if [ "$blocking_total" -gt 0 ] || [ "$not_scanned" -gt 0 ]; then
+              echo "::error::security gate failed: $blocking_total blocking finding(s), $not_scanned scanner(s) not scanned"
+              exit 1
+            fi
+            echo "security gate passed in enforce mode"
+          else
+            echo "advisory mode: $blocking_total blocking finding(s), $not_scanned not scanned — not failing the job"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "_Advisory mode: the gate reports but does not block. Re-run bootstrap with \`--enforce true\` to block._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Nothing to gate
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          echo "Event \`$GITHUB_EVENT_NAME\`: full scan, results uploaded and summarized, nothing to block." \
+            >> "$GITHUB_STEP_SUMMARY"

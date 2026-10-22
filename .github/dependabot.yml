@@ -1,0 +1,42 @@
+# Dependabot configuration installed into target repos by bootstrap.sh.
+# Ecosystems are listed unconditionally; Dependabot ignores a directory that
+# has no manifest.
+#
+# Every entry sets a cooldown. A newly published version is the window in which
+# a compromised release is still live, so updates wait a week before being
+# proposed. Semgrep's `dependabot-missing-cooldown` rule flags configs without
+# one.
+#
+# Only `default-days` is used. The `semver-*-days` refinements are tempting --
+# they would let patches through immediately -- but Dependabot rejects them for
+# `github-actions` ("not supported for the package ecosystem"), even though the
+# published JSON schema accepts them. Their status for `pip` and `npm` is
+# untested here, so they are left out rather than guessed at.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: pip
+    directory: "/python"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: npm
+    directory: "/node"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
