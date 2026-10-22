@@ -21,7 +21,7 @@ function handle(req, res) {
       case '/calc':
         return send(200, { result: calc.evaluate(url.searchParams.get('expr') ?? '') });
       case '/docs':
-        return send(200, { documents: files.list() });
+        return send(200, { content: files.read(url.searchParams.get('name') ?? 'readme.txt') });
       default:
         return send(404, { error: 'not found' });
     }
