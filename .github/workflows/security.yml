@@ -47,7 +47,7 @@ on:
 # `if:`, so the `detect` job resolves these into job outputs that the other jobs
 # branch on.
 env:
-  ENFORCE: "false"
+  ENFORCE: "true"
   CODEX_ENABLED: "false"
   CODEX_PROVIDER: ""
   CODEX_MODEL: ""
