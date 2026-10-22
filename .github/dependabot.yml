@@ -1,12 +1,22 @@
 # Dependabot configuration installed into target repos by bootstrap.sh.
 # Ecosystems are listed unconditionally; Dependabot ignores a directory that
 # has no manifest.
+#
+# Every entry sets a cooldown. A newly published version is the window in which
+# a compromised release is still live, so updates wait before being proposed --
+# longer for major bumps, not at all for patches, which are the ones worth
+# taking quickly. Semgrep's `dependabot-missing-cooldown` rule flags configs
+# without this.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-patch-days: 0
     commit-message:
       prefix: "chore(deps)"
 
@@ -14,6 +24,10 @@ updates:
     directory: "/python"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-patch-days: 0
     commit-message:
       prefix: "chore(deps)"
 
@@ -21,5 +35,9 @@ updates:
     directory: "/node"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-patch-days: 0
     commit-message:
       prefix: "chore(deps)"
