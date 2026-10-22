@@ -25,8 +25,11 @@ def create_app() -> Flask:
     def run(name: str):
         try:
             return jsonify(output=runner.run(name))
-        except ValueError as exc:
-            return jsonify(error=str(exc)), 400
+        except ValueError:
+            # The exception text echoes the caller's input, so it stays in the
+            # log rather than the response (CodeQL py/stack-trace-exposure).
+            app.logger.warning("rejected unknown command", exc_info=True)
+            return jsonify(error="unknown command", allowed=sorted(runner.ALLOWED)), 400
 
     return app
 
