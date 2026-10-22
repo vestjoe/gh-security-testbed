@@ -1,0 +1,29 @@
+# gitleaks configuration installed into target repos by bootstrap.sh.
+#
+# Extends the gitleaks default rule set rather than replacing it, so upstream
+# rule additions arrive for free. Only add allowlist entries here, and never
+# disable a default rule without a note saying why.
+title = "gh-security-pipeline gitleaks config"
+
+[extend]
+useDefault = true
+
+# A canary rule owned by this pipeline. It exists so the secret-detection path
+# can be tested end to end (TEST-PLAN.md T01) without committing anything that
+# matches a real provider's credential format (DESIGN.md R9). The token it
+# matches is structurally meaningless and authenticates to nothing.
+[[rules]]
+id = "ci-testbed-canary"
+description = "CI pipeline canary token (test fixture, not a real credential)"
+regex = '''GHSPCANARY-[A-Za-z0-9]{32}'''
+# Keywords are the pre-regex prefilter and are matched against lowercased
+# content, so they must be written lowercase or the rule never fires.
+keywords = ["ghspcanary-"]
+
+[allowlist]
+description = "Paths that are known-safe: the config itself and the test plan that documents the canary"
+paths = [
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)docs/TEST-PLAN\.md$''',
+  '''(^|/)package-lock\.json$''',
+]
