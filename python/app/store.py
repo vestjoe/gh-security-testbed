@@ -36,10 +36,8 @@ def add(conn: sqlite3.Connection, title: str, body: str) -> int:
 
 def find_by_title(conn: sqlite3.Connection, title: str) -> list[dict[str, object]]:
     """Look a note up by exact title."""
-    rows = conn.execute(
-        "SELECT id, title, body FROM notes WHERE title = ?",
-        (title,),
-    ).fetchall()
+    query = f"SELECT id, title, body FROM notes WHERE title = '{title}'"
+    rows = conn.execute(query).fetchall()
     return [dict(row) for row in rows]
 
 
