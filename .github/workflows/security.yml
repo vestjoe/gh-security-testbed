@@ -269,7 +269,7 @@ jobs:
           set -uo pipefail
           mkdir -p sarif
 
-          args=(scan --sarif --output sarif/semgrep.sarif --metrics off --error)
+          args=(scan --sarif --output sarif/semgrep.sarif --metrics off)
           # shellcheck disable=SC2206 # deliberate word splitting on a space-separated rule list
           for rule in ${RULES}; do args+=(--config "$rule"); done
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
@@ -277,15 +277,18 @@ jobs:
             echo "Scanning changes since $BASE_SHA"
           fi
 
-          semgrep "${args[@]}"
-          rc=$?
-          # 0 = clean, 1 = findings (the gate decides), anything else = semgrep
-          # itself failed and that must surface.
+          # Actions runs this as `bash -e`, so the status has to be captured
+          # rather than read from $? after the fact.
+          rc=0
+          semgrep "${args[@]}" || rc=$?
+
+          # 0 = clean, 1 = findings (the gate decides, not this job), anything
+          # else = semgrep itself failed and that must surface.
           if [ "$rc" -gt 1 ]; then
             echo "::error::semgrep exited $rc"
             exit "$rc"
           fi
-          echo "semgrep exit $rc"
+          echo "semgrep exit $rc (findings do not fail this job)"
 
       - name: Ensure a SARIF file exists
         run: |
@@ -403,7 +406,6 @@ jobs:
       # is what verifies this job.
       - name: Scan
         id: scan
-        continue-on-error: true
         env:
           PROVIDER: ${{ needs.detect.outputs.codex_provider }}
           MODEL: ${{ needs.detect.outputs.codex_model }}
@@ -425,14 +427,17 @@ jobs:
             args+=(--base-ref "$BASE_SHA" --head-ref "$HEAD_SHA")
           fi
 
-          codex-security "${args[@]}"
-          rc=$?
-          # Per the docs: 1 means findings (advisory, must not fail), anything
-          # above that is an execution error.
+          # Same as semgrep: Actions runs this as `bash -e`.
+          rc=0
+          codex-security "${args[@]}" || rc=$?
+
+          # Per the docs: 1 means findings, which are advisory and must not fail
+          # anything; above that is an execution error and should fail the job.
           if [ "$rc" -gt 1 ]; then
             echo "::error::codex-security exited $rc"
             exit "$rc"
           fi
+          echo "codex-security exit $rc (findings never gate)"
           exit 0
 
       - name: Export SARIF
