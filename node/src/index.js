@@ -4,6 +4,8 @@
 // nothing external.
 
 const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
 const calc = require('./calc');
 const files = require('./files');
 
@@ -20,8 +22,13 @@ function handle(req, res) {
         return send(200, { status: 'ok' });
       case '/calc':
         return send(200, { result: calc.evaluate(url.searchParams.get('expr') ?? '') });
-      case '/docs':
-        return send(200, { documents: files.list() });
+      case '/docs': {
+        // T05b: identical flaw to T05, but the sink sits in this file rather
+        // than behind a module boundary.
+        const name = url.searchParams.get('name') ?? 'readme.txt';
+        const content = fs.readFileSync(path.join(files.DOC_DIR, name), 'utf8');
+        return send(200, { content });
+      }
       default:
         return send(404, { error: 'not found' });
     }
