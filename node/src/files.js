@@ -19,11 +19,7 @@ function list() {
 }
 
 function read(name) {
-  const file = ALLOWED.get(name);
-  if (!file) {
-    throw new Error(`unknown document: ${name}`);
-  }
-  return fs.readFileSync(path.join(DOC_DIR, file), 'utf8');
+  return fs.readFileSync(path.join(DOC_DIR, name), 'utf8');
 }
 
 module.exports = { list, read, DOC_DIR };
