@@ -163,6 +163,9 @@ jobs:
             echo "| codex | $codex (provider: $codex_provider) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          echo "::error::T10: deliberate detect failure, to verify the gate fails closed"
+          exit 1
+
           if [ "$IS_FORK_PR" = "true" ]; then
             echo "::notice::Fork pull request: the token is read-only, so code scanning upload, CodeQL and Codex are skipped. gitleaks and semgrep still run and the gate still judges their findings."
           elif [ "$upload" != "true" ]; then
