@@ -126,9 +126,15 @@ jobs:
           codex_model=$(pick "$IN_CODEX_MODEL" "$CODEX_MODEL" "")
           codeql_languages=$(pick "$IN_CODEQL_LANGUAGES" "$CODEQL_LANGUAGES" "")
 
-          # Fork PRs get no secrets, so the Codex job cannot authenticate.
+          # A fork PR's token is read-only. It carries no secrets, so Codex
+          # cannot authenticate, and no `security-events: write`, so nothing can
+          # be uploaded to code scanning. Turn both off rather than let the
+          # steps fail: the gitleaks and semgrep SARIF artifacts the gate reads
+          # are produced either way, so a fork PR is still gated normally.
           if [ "$IS_FORK_PR" = "true" ]; then
             codex=false
+            upload=false
+            codeql=false
           fi
 
           {
@@ -157,7 +163,9 @@ jobs:
             echo "| codex | $codex (provider: $codex_provider) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$upload" != "true" ]; then
+          if [ "$IS_FORK_PR" = "true" ]; then
+            echo "::notice::Fork pull request: the token is read-only, so code scanning upload, CodeQL and Codex are skipped. gitleaks and semgrep still run and the gate still judges their findings."
+          elif [ "$upload" != "true" ]; then
             echo "::notice::Code scanning upload unavailable on this repo (private without GitHub Code Security). Findings are in the gate summary and the sarif-* artifacts; CodeQL is skipped."
           fi
 
@@ -227,14 +235,22 @@ jobs:
           fi
           echo "results: $(jq '[.runs[].results[]] | length' sarif/gitleaks.sarif)"
 
+      # continue-on-error: this upload is a convenience, not the gate's input.
+      # If it fails the artifact below must still be written, or the gate reads
+      # the scanner as "not scanned" and blocks a PR over a reporting hiccup.
       - name: Upload SARIF to code scanning
         if: needs.detect.outputs.upload == 'true'
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: sarif/gitleaks.sarif
           category: gitleaks
 
+      # always(): this artifact is what the gate reads. It is uploaded even
+      # when an earlier step failed, so "not scanned" means the scan really
+      # did not happen rather than that some later step did not run.
       - name: Upload SARIF artifact
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sarif-gitleaks
@@ -309,14 +325,22 @@ jobs:
           fi
           echo "results: $(jq '[.runs[].results[]] | length' sarif/semgrep.sarif)"
 
+      # continue-on-error: this upload is a convenience, not the gate's input.
+      # If it fails the artifact below must still be written, or the gate reads
+      # the scanner as "not scanned" and blocks a PR over a reporting hiccup.
       - name: Upload SARIF to code scanning
         if: needs.detect.outputs.upload == 'true'
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: sarif/semgrep.sarif
           category: semgrep
 
+      # always(): this artifact is what the gate reads. It is uploaded even
+      # when an earlier step failed, so "not scanned" means the scan really
+      # did not happen rather than that some later step did not run.
       - name: Upload SARIF artifact
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sarif-semgrep
@@ -465,6 +489,7 @@ jobs:
 
       - name: Upload SARIF to code scanning
         if: needs.detect.outputs.upload == 'true' && hashFiles('sarif/codex.sarif') != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: sarif/codex.sarif
@@ -499,6 +524,22 @@ jobs:
       # Only the gated scanners are downloaded, by exact name. CodeQL and Codex
       # are deliberately excluded (DESIGN.md "Gate policy"). A missing artifact
       # must not fail this step -- the policy below reports it as "not scanned".
+      # The gate reads its mode from a detect job output. If detect did not
+      # succeed that output is the empty string, and every scanner it feeds was
+      # skipped -- so the one thing the gate must never do is report a pass.
+      - name: Require a successful detect job
+        if: github.event_name == 'pull_request' && needs.detect.result != 'success'
+        run: |
+          set -euo pipefail
+          echo "::error::the detect job did not succeed (result: ${{ needs.detect.result }}), so the gate has no configuration to apply and no scanner results to read. Failing closed."
+          {
+            echo "## Security gate"
+            echo
+            echo "**Failed closed.** The \`detect\` job's result was \`${{ needs.detect.result }}\`,"
+            echo "so the gate could not resolve its mode and no scanner ran. Re-run the workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
       - name: Download gitleaks SARIF
         if: github.event_name == 'pull_request'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -554,13 +595,29 @@ jobs:
           JQ
           # GATE-JQ-END
 
+          # GATE-MODE-BEGIN -- tests/gate-test.sh extracts this function verbatim.
+          # Resolve the gate's operating mode from the detect job's `enforce`
+          # output. Anything that is not exactly "true" or "false" is
+          # "unresolved": the output was lost or corrupted, which is a pipeline
+          # failure rather than a verdict, and is failed closed below.
+          gate_mode() { # gate_mode <enforce-output>
+            case "${1:-}" in
+              true)  printf 'enforce' ;;
+              false) printf 'advisory' ;;
+              *)     printf 'unresolved' ;;
+            esac
+          }
+          # GATE-MODE-END
+
+          MODE=$(gate_mode "$ENFORCE_EFFECTIVE")
+
           blocking_total=0
           not_scanned=0
 
           {
             echo "## Security gate"
             echo
-            echo "Mode: **$([ "$ENFORCE_EFFECTIVE" = "true" ] && echo enforce || echo advisory)** · code scanning upload: \`$UPLOAD\`"
+            echo "Mode: **$MODE** · code scanning upload: \`$UPLOAD\`"
             echo
             echo "| Scanner | Job | Findings | Blocking | Status |"
             echo "| --- | --- | --- | --- | --- |"
@@ -618,17 +675,29 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           done
 
-          if [ "$ENFORCE_EFFECTIVE" = "true" ]; then
-            if [ "$blocking_total" -gt 0 ] || [ "$not_scanned" -gt 0 ]; then
-              echo "::error::security gate failed: $blocking_total blocking finding(s), $not_scanned scanner(s) not scanned"
+          case "$MODE" in
+            enforce)
+              if [ "$blocking_total" -gt 0 ] || [ "$not_scanned" -gt 0 ]; then
+                echo "::error::security gate failed: $blocking_total blocking finding(s), $not_scanned scanner(s) not scanned"
+                exit 1
+              fi
+              echo "security gate passed in enforce mode"
+              ;;
+            advisory)
+              echo "advisory mode: $blocking_total blocking finding(s), $not_scanned not scanned — not failing the job"
+              echo >> "$GITHUB_STEP_SUMMARY"
+              echo "_Advisory mode: the gate reports but does not block. Re-run bootstrap with \`--enforce true\` to block._" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              # Fail closed. Advisory mode is a decision about findings; an
+              # unreadable configuration is not a finding, and a green check
+              # here would assert a pass the gate never evaluated.
+              echo "::error::security gate could not resolve its mode (enforce output: '$ENFORCE_EFFECTIVE'). Failing closed."
+              echo >> "$GITHUB_STEP_SUMMARY"
+              echo "**Failed closed:** the gate could not resolve its mode, so neither policy was applied." >> "$GITHUB_STEP_SUMMARY"
               exit 1
-            fi
-            echo "security gate passed in enforce mode"
-          else
-            echo "advisory mode: $blocking_total blocking finding(s), $not_scanned not scanned — not failing the job"
-            echo >> "$GITHUB_STEP_SUMMARY"
-            echo "_Advisory mode: the gate reports but does not block. Re-run bootstrap with \`--enforce true\` to block._" >> "$GITHUB_STEP_SUMMARY"
-          fi
+              ;;
+          esac
 
       - name: Nothing to gate
         if: github.event_name != 'pull_request'
